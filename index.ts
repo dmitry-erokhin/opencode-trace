@@ -1,5 +1,5 @@
 /**
- * OpenCode server plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
+ * OpenCode V2 plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
  *
  * Each trace is an interactive html file whose trailing unterminated html-comment contains
  * one json object per line. To read the logs programmatically, strip everything up to that
@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
+import { Plugin } from "@opencode/plugin"
 
 const root = path.join(os.homedir(), "opencode-trace")
 const PREAMBLE = `<!DOCTYPE html>
@@ -47,11 +48,20 @@ const files = new Map<string, string>()
 /** Mutable global state: maps `session\nmethod\nurl\n_kind\nmeta|real` to the previous raw body used as the delta base. */
 const prevs = new Map<string, object>()
 
-/** Mutable global state: maps OpenCode session ids to the next per-session fetch sequence number. */
+/** Mutable global state: maps OpenCode session ids to the next per-session request sequence number. */
 const ids = new Map<string, number>()
 
-/** Mutable module state: the unpatched global fetch for this module instance, assigned inside `server()`. */
-let orig: typeof globalThis.fetch | undefined
+/** V2 response hooks receive the same request object as request hooks. */
+const traces = new WeakMap<Request, Trace>()
+
+interface Trace {
+  name: string
+  common: {
+    _id: number
+    _purpose: string
+    _url: string
+  }
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v)
@@ -519,27 +529,40 @@ function responseAsJson(text: string, url: string): Record<string, unknown> {
   }
 }
 
+function errorRow(err: unknown): { _error: string; _stack?: string } {
+  return err instanceof Error
+    ? err.stack === undefined
+      ? { _error: err.message }
+      : { _error: err.message, _stack: err.stack }
+    : { _error: String(err) }
+}
+
+function filename(title: string | undefined, session: string): string {
+  return (title ?? session ?? '')
+    .replace(/[^A-Za-z0-9 _-]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 10)
+    .join(" ")
+    .slice(0, 50)
+    .trim() || "session"
+}
+
+function trace(session: string, name: string, purpose: string, url: string): Trace {
+  const id = (ids.get(session) ?? 0) + 1
+  ids.set(session, id)
+  return {
+    name,
+    common: { _id: id, _purpose: purpose, _url: url },
+  }
+}
+
 /**
- * Intercepts matching OpenCode LLM fetches and logs request/response rows.
- * Side effects: mutates `prevs`, mutates `ids`, and writes logs to disk.
+ * Logs one raw V2 HTTP request. Side effects: mutates `prevs`, `ids`, and `traces`, then writes a log row.
  */
-async function tracedFetch(
-  input: Parameters<typeof globalThis.fetch>[0],
-  init?: Parameters<typeof globalThis.fetch>[1],
-): Promise<Response> {
+async function traceRequest(session: string, request: Request): Promise<void> {
   const now = (): string => new Date().toISOString()
-  const error = (err: unknown): { _error: string; _stack?: string } =>
-    err instanceof Error
-      ? err.stack === undefined
-        ? { _error: err.message }
-        : { _error: err.message, _stack: err.stack }
-      : { _error: String(err) }
-
-  const req = new Request(input, init)
-  const session = req.headers.get("x-opencode-session") ?? req.headers.get("x-session-affinity") ?? req.headers.get("session_id") ?? undefined;
-  if (session === undefined) return orig!(req);
-
-  const text = await req.clone().text().catch(() => "")
+  const text = await request.clone().text().catch(() => "")
   const raw = ((): Record<string, unknown> => {
     try {
       const body = JSON.parse(text) as unknown
@@ -554,90 +577,63 @@ async function tracedFetch(
   // I tried a bunch of heuristics, and this one "no tools" was the one that worked best across a variety of models.
   // We calculate it here based on the request, and store it on both request and response, since otherwise
   // there are no reliable indicators on the response jsonl for our viewer to key off.
-  const seq = (ids.get(session) ?? 0) + 1
-  ids.set(session, seq)
-  const common = { _id: seq, _purpose: purpose, _url: req.url }
-  const name = (title ?? session ?? '')
-    .replace(/[^A-Za-z0-9 _-]+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .slice(0, 10)
-    .join(" ")
-    .slice(0, 50)
-    .trim() || "session";
-  const requestKey = `${session}\n${req.method}\n${req.url}\nrequest\n${purpose}`
+  const current = trace(session, filename(title, session), purpose, request.url)
+  traces.set(request, current)
+  const requestKey = `${session}\n${request.method}\n${request.url}\nrequest\n${purpose}`
   const requestNext = raw as object
   const [requestRow] = delta(prevs.get(requestKey), requestNext)
   prevs.set(requestKey, requestNext)
-  writeNoThrow(session, name, {
+  writeNoThrow(session, current.name, {
     ...(requestRow as Record<string, unknown>),
-    ...common,
+    ...current.common,
     _kind: "request",
     _ts: now(),
   })
+}
 
-  const res = await orig!(req).catch((err) => {
-    writeNoThrow(session, name, {
-      ...common,
-      _kind: "error",
-      _ts: now(),
-      ...error(err),
-    })
-    throw err
-  });
-  // We'll register background processing of the response, once it comes. But return 'res' immediately.
-  void res
-    .clone()
-    .text()
+/** Logs one raw V2 HTTP response without delaying OpenCode's response consumption. */
+function traceResponse(session: string, request: Request, response: Response): void {
+  const current = traces.get(request) ?? trace(session, "session", "[meta]", request.url)
+  void Promise.resolve()
+    .then(() => response.clone().text())
     .then((body) => {
-      const json = responseAsJson(body, req.url)
+      const json = responseAsJson(body, request.url)
       const detail = isRecord(json) && isRecord(json.error) && typeof json.error.message === "string"
         ? json.error.message
         : isRecord(json) && typeof json.error === "string"
           ? json.error
-          : `${res.status} ${res.statusText}`
-      const responseNext = (!res.ok
-        ? { ...json, _status: res.status, _status_text: res.statusText, _error: detail }
+          : `${response.status} ${response.statusText}`
+      const responseNext = (!response.ok
+        ? { ...json, _status: response.status, _status_text: response.statusText, _error: detail }
         : json) as object
-      const responseKey = `${session}\n${req.method}\n${req.url}\nresponse\n${purpose}`
+      const responseKey = `${session}\n${request.method}\n${request.url}\nresponse\n${current.common._purpose}`
       const [responseRow] = delta(prevs.get(responseKey), responseNext)
       prevs.set(responseKey, responseNext)
-      writeNoThrow(session, name, {
+      writeNoThrow(session, current.name, {
         ...(responseRow as Record<string, unknown>),
-        ...common,
+        ...current.common,
         _kind: "response",
-        _ts: now(),
+        _ts: new Date().toISOString(),
       })
     })
     .catch((err) => {
-      writeNoThrow(session, name, {
-        ...common,
+      writeNoThrow(session, current.name, {
+        ...current.common,
         _kind: "error",
-        _ts: now(),
-        ...error(err),
+        _ts: new Date().toISOString(),
+        ...errorRow(err),
       })
     })
-  return res
 }
 
-/* Plugin model:
- * - This module is loaded with dynamic import() when plugin state is initialized for an instance/directory.
- *   The module import is normally cached, so our top-level state like `orig` survives repeated hook initialization
- * - Opencode calls `default.server()` when it initializes this plugin's server hooks for that instance.
- *   This can happen more than once per process across instance reload/dispose, which is why our fetch()
- *   patch is guarded even though the module itself is loaded only once.
- * - Opencode v1.3 has a single unified process for both TUI and server, so its plugin entrypoint `default` is just a function.
- * - Opencode v1.4 has two separate entrypoints, `default.tui()` and `default.server()`
- */
-const main: (() => Promise<object>) & {id?: unknown, server?: unknown} = async () => {
-  if (!orig) {
-    orig = globalThis.fetch.bind(globalThis);
-    globalThis.fetch = tracedFetch;
-  }
-  return {};
-};
-
-const entrypoint = main; // opencode v1.3 expects default export to be a function
-entrypoint.id = "ljw1004.opencode-trace";
-entrypoint.server = main; // opencode v1.4 expects default export to be an object, with server() being what executes
-export default entrypoint;
+export default Plugin.define({
+  id: "ljw1004.opencode-trace",
+  async setup(ctx) {
+    await ctx.session.hook("http.request", async (event) => {
+      await traceRequest(String(event.sessionID), event.request)
+    })
+    await ctx.session.hook("http.response", (event) => {
+      traceResponse(String(event.sessionID), event.request, event.response)
+    })
+  },
+})
